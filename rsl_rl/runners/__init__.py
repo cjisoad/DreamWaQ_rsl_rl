@@ -6,6 +6,7 @@
 """Implementation of runners for environment-agent interaction."""
 
 from .on_policy_runner import OnPolicyRunner  # noqa: I001
+from .dwaq_on_policy_runner import DWAQOnPolicyRunner
 from .distillation_runner import DistillationRunner
 
-__all__ = ["DistillationRunner", "OnPolicyRunner"]
+__all__ = ["DistillationRunner", "DWAQOnPolicyRunner", "OnPolicyRunner"]
