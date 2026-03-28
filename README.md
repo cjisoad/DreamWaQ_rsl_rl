@@ -36,7 +36,7 @@ git clone <your-repo-url>
 cd rsl_rl
 pip install -e .
 ```
-（下面的部分其实并没有必要多做研究，直接把代码丢给codex，它可以很好的帮你配置好你的Isaaclab调用）
+（只是调一下包的话，下面的部分其实并没有必要多做研究，直接把代码丢给codex，它可以很好的帮你配置好你的Isaaclab调用）
 
 ## 调用方式
 
