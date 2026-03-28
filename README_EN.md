@@ -1,19 +1,19 @@
 # DreamWaQ-RSL-RL
 
-[English Version](./README_EN.md)
+[中文说明](./README.md)
 
-面向机器人强化学习的轻量训练库。本仓库基于原始 `rsl_rl` 进行开发，并在保持原生调用风格的前提下加入了**DreamWaQ**算法支持。
+This repository is a lightweight reinforcement learning library for robotics, developed on top of the original `rsl_rl`, with added support for the **DreamWaQ** algorithm while preserving the native calling style.
 
-DreamWaQ算法的调用尽量沿用原生 `rsl_rl` 的风格，确保在只改动配置文件的基础上即可适配IsaacLab：
+The DreamWaQ integration is designed to stay as close as possible to native `rsl_rl`, so that Isaac Lab can be adapted mainly through configuration changes.
 
-已使用以下版本的软件验证：
+Validated with:
 
 - `Isaac Sim 5.1.0`
 - `Isaac Lab 2.2.1`
 
-## 仓库内容
+## Repository Contents
 
-当前算法库包含以下算法与组件：
+The current algorithm library includes:
 
 - `PPO`
 - `Student-Teacher Distillation`
@@ -21,96 +21,95 @@ DreamWaQ算法的调用尽量沿用原生 `rsl_rl` 的风格，确保在只改�
 - `Random Network Distillation (RND)`
 - `Symmetry-based Augmentation`
 
-DreamWaQ算法相关入口位于：
+DreamWaQ-related entry points:
 
 - [`rsl_rl/algorithms/dwaq_ppo.py`](./rsl_rl/algorithms/dwaq_ppo.py)
 - [`rsl_rl/modules/actor_critic_DWAQ.py`](./rsl_rl/modules/actor_critic_DWAQ.py)
 - [`rsl_rl/runners/on_policy_runner.py`](./rsl_rl/runners/on_policy_runner.py)
 
-## 安装
+## Installation
 
-建议使用 editable 安装：
+Recommended installation:
 
 ```bash
 git clone <your-repo-url>
 cd rsl_rl
 pip install -e .
 ```
-（下面的部分其实并没有必要多做研究，直接把代码丢给codex，它可以很好的帮你配置好你的Isaaclab调用）
 
-## 调用方式
+## Calling Flow
 
-标准 `rsl_rl` 的核心调用链是：
+The standard `rsl_rl` flow is:
 
-1. 环境返回 `TensorDict`
-2. `OnPolicyRunner` 读取 `obs_groups`
-3. policy 从 `TensorDict` 中提取 actor / critic 所需观测
-4. algorithm 调用 `act / process_env_step / compute_returns / update`
+1. the environment returns a `TensorDict`
+2. `OnPolicyRunner` resolves `obs_groups`
+3. the policy extracts actor / critic inputs from the `TensorDict`
+4. the algorithm runs `act / process_env_step / compute_returns / update`
 
-这也是当前 DreamWaQ算法 的调用方式。也就是说，DreamWaQ算法 不再需要一条单独的训练分支。
+This is also how DreamWaQ works in this repository. In other words, DreamWaQ no longer needs a dedicated training branch.
 
-## DreamWaQ算法 接入说明
+## DreamWaQ Integration Guide
 
-### 1. 观测协议
+### 1. Observation protocol
 
-如果要使用DreamWaQ算法，环境返回的 `TensorDict` 至少需要包含这些 key：
+To use DreamWaQ, the `TensorDict` returned by the environment should contain at least:
 
 - `policy`
-- `obs_history` 或 `obs_hist`
-- `privileged` 或其他供 critic 使用的 group
+- `obs_history` or `obs_hist`
+- one or more critic-related groups such as `privileged`
 
-最常见的观测组织方式如下：
+Typical structure:
 
 ```python
 from tensordict import TensorDict
 
 obs = TensorDict(
     {
-        "policy": actor_obs,          # [num_envs, actor_dim]
-        "privileged": privileged_obs, # [num_envs, privileged_dim]
-        "obs_history": obs_history,   # [num_envs, actor_dim * history_len]
+        "policy": actor_obs,
+        "privileged": privileged_obs,
+        "obs_history": obs_history,
     },
     batch_size=[num_envs],
 )
 ```
 
-其中：
+Where:
 
-- `policy` 是 actor 当前时刻观测
-- `obs_history` 是展平后的历史观测
-- critic 的输入由 `obs_groups["critic"]` 决定
+- `policy` is the current actor observation
+- `obs_history` is the flattened observation history
+- critic inputs are defined by `obs_groups["critic"]`
 
-### 2. `obs_groups` 约定
+### 2. `obs_groups`
 
-DreamWaQ算法仍然沿用原生 `obs_groups`：
+DreamWaQ still uses the native `obs_groups` mechanism:
 
 ```yaml
 obs_groups: {"policy": ["policy"], "critic": ["policy", "privileged"]}
 ```
 
-这表示：
+This means:
 
-- actor 只吃 `policy`
-- critic 吃 `policy + privileged`
+- the actor consumes `policy`
+- the critic consumes `policy + privileged`
 
-### 3. 重要约束
+### 3. Important Constraint
 
-DreamWaQ算法当前的速度监督仍采用如下切片逻辑：
+The current DreamWaQ velocity supervision still assumes:
 
 ```python
 vel_target = critic_obs[:, obs_dim : obs_dim + 3]
 ```
 
-这意味着 critic 输入的拼接顺序需要满足：
+So the critic input layout must satisfy:
 
-1. 前 `obs_dim` 维对应 actor 观测
-2. 紧接着 3 维是目标速度
+1. the first `obs_dim` dimensions match the actor observation
+2. the next `3` dimensions correspond to target velocity
 
-如果你的 critic 观测顺序不是这个结构，需要同步修改 DreamWaQ算法 loss。
+If your critic observation layout differs, you need to adjust the DreamWaQ loss accordingly.
 
-## DreamWaQ算法 配置指南
+## DreamWaQ Configuration Guide
 
-下面是一份最小可用配置片段，调用侧风格与原生 PPO 基本一致。
+Below is a minimal configuration snippet. The caller-side style remains very close to native PPO.
 
 ```yaml
 runner:
@@ -149,11 +148,9 @@ runner:
     beta: 1.0
 ```
 
-项目仍然保留了 `DWAQOnPolicyRunner` 这个类名，也可以继续使用；它当前只是兼容包装，推荐优先用 `OnPolicyRunner`。
+The project still keeps the `DWAQOnPolicyRunner` class name for compatibility. It can still be used, but `OnPolicyRunner` is the recommended entry point.
 
-## DreamWaQ算法 最小环境示例
-
-下面给出一个最小环境侧返回格式示例：
+## Minimal DreamWaQ Environment Example
 
 ```python
 import torch
@@ -189,9 +186,7 @@ class MyEnv:
         return obs, rewards, dones, extras
 ```
 
-## 训练侧最小示例
-
-如果你的外部仓库是通过已安装的 `rsl_rl` 调用训练器，最小形态如下：
+## Minimal Training Example
 
 ```python
 from rsl_rl.runners import OnPolicyRunner
@@ -202,9 +197,9 @@ runner = OnPolicyRunner(env, runner_cfg, log_dir="logs/demo", device="cuda:0")
 runner.learn(num_learning_iterations=runner_cfg["max_iterations"])
 ```
 
-## 致谢
+## Credits
 
-原始 `rsl_rl` 由 ETH Zurich Robotic Systems Lab 与 NVIDIA 维护。贡献者请参考：
+The original `rsl_rl` is maintained by ETH Zurich Robotic Systems Lab and NVIDIA. See:
 
 - [CONTRIBUTORS.md](./CONTRIBUTORS.md)
 - [CITATION.cff](./CITATION.cff)

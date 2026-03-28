@@ -8,9 +8,10 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from tensordict import TensorDict
 
 from rsl_rl.modules import ActorCritic_DWAQ
-from rsl_rl.storage import RolloutStorageDWAQ
+from rsl_rl.storage import RolloutStorage
 
 
 class DWAQPPO:
@@ -34,20 +35,16 @@ class DWAQPPO:
         schedule: str = "fixed",
         desired_kl: float = 0.01,
         device: str = "cpu",
-        obs_dim: int = 45,
+        beta: float = 1.0,
         multi_gpu_cfg: dict | None = None,
     ) -> None:
         self.device = device
-        self.obs_dim = obs_dim
         self.policy = policy
         self.policy.to(self.device)
         self.optimizer = optim.Adam(self.policy.parameters(), lr=learning_rate)
-        self.storage: RolloutStorageDWAQ | None = None
-        self.transition = RolloutStorageDWAQ.Transition()
+        self.storage: RolloutStorage | None = None
+        self.transition = RolloutStorage.Transition()
 
-        self.desired_kl = desired_kl
-        self.schedule = schedule
-        self.learning_rate = learning_rate
         self.clip_param = clip_param
         self.num_learning_epochs = num_learning_epochs
         self.num_mini_batches = num_mini_batches
@@ -57,6 +54,13 @@ class DWAQPPO:
         self.lam = lam
         self.max_grad_norm = max_grad_norm
         self.use_clipped_value_loss = use_clipped_value_loss
+        self.desired_kl = desired_kl
+        self.schedule = schedule
+        self.learning_rate = learning_rate
+        self.beta = beta
+
+        self.rnd = None
+        self.rnd_optimizer = None
 
         self.is_multi_gpu = multi_gpu_cfg is not None
         if multi_gpu_cfg is not None:
@@ -68,42 +72,36 @@ class DWAQPPO:
 
     def init_storage(
         self,
+        training_type: str,
         num_envs: int,
         num_transitions_per_env: int,
-        actor_obs_shape: list[int],
-        critic_obs_shape: list[int],
-        obs_hist_shape: list[int],
-        action_shape: list[int],
+        obs: TensorDict,
+        actions_shape: tuple[int] | list[int],
     ) -> None:
-        self.storage = RolloutStorageDWAQ(
+        if training_type != "rl":
+            raise ValueError("DWAQPPO only supports 'rl' training_type.")
+        self.storage = RolloutStorage(
+            training_type,
             num_envs,
             num_transitions_per_env,
-            actor_obs_shape,
-            critic_obs_shape,
-            obs_hist_shape,
-            action_shape,
+            obs,
+            actions_shape,
             self.device,
         )
 
-    def act(
-        self,
-        obs: torch.Tensor,
-        critic_obs: torch.Tensor,
-        prev_critic_obs: torch.Tensor,
-        obs_history: torch.Tensor,
-    ) -> torch.Tensor:
-        self.transition.actions = self.policy.act(obs, obs_history).detach()
-        self.transition.values = self.policy.evaluate(critic_obs).detach()
+    def act(self, obs: TensorDict) -> torch.Tensor:
+        self.transition.actions = self.policy.act(obs).detach()
+        self.transition.values = self.policy.evaluate(obs).detach()
         self.transition.actions_log_prob = self.policy.get_actions_log_prob(self.transition.actions).detach()
         self.transition.action_mean = self.policy.action_mean.detach()
         self.transition.action_sigma = self.policy.action_std.detach()
         self.transition.observations = obs
-        self.transition.observation_history = obs_history
-        self.transition.critic_observations = critic_obs
-        self.transition.prev_critic_obs = prev_critic_obs
         return self.transition.actions
 
-    def process_env_step(self, rewards: torch.Tensor, dones: torch.Tensor, extras: dict) -> None:
+    def process_env_step(
+        self, obs: TensorDict, rewards: torch.Tensor, dones: torch.Tensor, extras: dict[str, torch.Tensor]
+    ) -> None:
+        self.policy.update_normalization(obs)
         self.transition.rewards = rewards.clone()
         self.transition.dones = dones
         if "time_outs" in extras:
@@ -114,11 +112,11 @@ class DWAQPPO:
         self.transition.clear()
         self.policy.reset(dones)
 
-    def compute_returns(self, last_critic_obs: torch.Tensor) -> None:
-        last_values = self.policy.evaluate(last_critic_obs).detach()
+    def compute_returns(self, obs: TensorDict) -> None:
+        last_values = self.policy.evaluate(obs).detach()
         self.storage.compute_returns(last_values, self.gamma, self.lam)
 
-    def update(self, beta: float = 1.0) -> dict[str, float]:
+    def update(self) -> dict[str, float]:
         mean_value_loss = 0.0
         mean_surrogate_loss = 0.0
         mean_entropy = 0.0
@@ -127,9 +125,6 @@ class DWAQPPO:
         generator = self.storage.mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
         for (
             obs_batch,
-            critic_obs_batch,
-            _prev_critic_obs_batch,
-            obs_hist_batch,
             actions_batch,
             target_values_batch,
             advantages_batch,
@@ -140,18 +135,9 @@ class DWAQPPO:
             hidden_states_batch,
             masks_batch,
         ) in generator:
-            self.policy.act(
-                obs_batch,
-                obs_hist_batch,
-                masks=masks_batch,
-                hidden_states=hidden_states_batch[0],
-            )
+            self.policy.act(obs_batch, masks=masks_batch, hidden_state=hidden_states_batch[0])
             actions_log_prob_batch = self.policy.get_actions_log_prob(actions_batch)
-            value_batch = self.policy.evaluate(
-                critic_obs_batch,
-                masks=masks_batch,
-                hidden_states=hidden_states_batch[1],
-            )
+            value_batch = self.policy.evaluate(obs_batch, masks=masks_batch, hidden_state=hidden_states_batch[1])
             mu_batch = self.policy.action_mean
             sigma_batch = self.policy.action_std
             entropy_batch = self.policy.entropy
@@ -189,16 +175,17 @@ class DWAQPPO:
                 _logvar_vel,
                 mean_latent,
                 logvar_latent,
-            ) = self.policy.cenet_forward(obs_hist_batch)
+            ) = self.policy.cenet_forward(self.policy.get_obs_history(obs_batch))
 
-            vel_target = critic_obs_batch[:, self.obs_dim : self.obs_dim + 3].detach()
-            decode_target = obs_batch[:, : self.obs_dim].detach()
+            critic_obs_batch = self.policy.get_critic_obs(obs_batch)
+            vel_target = critic_obs_batch[:, self.policy.obs_dim : self.policy.obs_dim + 3].detach()
+            decode_target = self.policy.get_actor_obs(obs_batch).detach()
             logvar_latent = torch.clamp(logvar_latent, min=-10.0, max=10.0)
             kl_divergence = -0.5 * torch.sum(1 + logvar_latent - mean_latent.pow(2) - logvar_latent.exp())
             autoencoder_loss = (
                 nn.MSELoss()(code_vel, vel_target)
                 + nn.MSELoss()(decode, decode_target)
-                + beta * kl_divergence
+                + self.beta * kl_divergence
             ) / self.num_mini_batches
 
             ratio = torch.exp(actions_log_prob_batch - torch.squeeze(old_actions_log_prob_batch))

@@ -35,7 +35,6 @@ class OnPolicyRunner:
         self.policy_cfg = train_cfg["policy"]
         self.device = device
         self.env = env
-        self._is_dwaq_runner = self.alg_cfg.get("class_name") == "DWAQPPO"
 
         # Check if multi-GPU is enabled
         self._configure_multi_gpu()
@@ -44,19 +43,15 @@ class OnPolicyRunner:
         self.num_steps_per_env = self.cfg["num_steps_per_env"]
         self.save_interval = self.cfg["save_interval"]
 
-        if self._is_dwaq_runner:
-            self._prepare_dwaq_context()
-            self.alg = self._construct_dwaq_algorithm()
-        else:
-            # Query observations from environment for algorithm construction
-            obs = self.env.get_observations()
-            default_sets = ["critic"]
-            if "rnd_cfg" in self.alg_cfg and self.alg_cfg["rnd_cfg"] is not None:
-                default_sets.append("rnd_state")
-            self.cfg["obs_groups"] = resolve_obs_groups(obs, self.cfg["obs_groups"], default_sets)
+        # Query observations from environment for algorithm construction
+        obs = self.env.get_observations()
+        default_sets = ["critic"]
+        if "rnd_cfg" in self.alg_cfg and self.alg_cfg["rnd_cfg"] is not None:
+            default_sets.append("rnd_state")
+        self.cfg["obs_groups"] = resolve_obs_groups(obs, self.cfg["obs_groups"], default_sets)
 
-            # Create the algorithm
-            self.alg = self._construct_algorithm(obs)
+        # Create the algorithm
+        self.alg = self._construct_algorithm(obs)
 
         # Decide whether to disable logging
         # Note: We only log from the process with rank 0 (main process)
@@ -71,10 +66,6 @@ class OnPolicyRunner:
         self.git_status_repos = [rsl_rl.__file__]
 
     def learn(self, num_learning_iterations: int, init_at_random_ep_len: bool = False) -> None:
-        if self._is_dwaq_runner:
-            self._learn_dwaq(num_learning_iterations, init_at_random_ep_len)
-            return
-
         # Initialize writer
         self._prepare_logging_writer()
 
@@ -407,7 +398,7 @@ class OnPolicyRunner:
         # Set device to the local rank
         torch.cuda.set_device(self.gpu_local_rank)
 
-    def _construct_algorithm(self, obs: TensorDict) -> PPO:
+    def _construct_algorithm(self, obs: TensorDict) -> PPO | DWAQPPO:
         """Construct the actor-critic algorithm."""
         # Resolve RND config
         self.alg_cfg = resolve_rnd_config(self.alg_cfg, obs, self.cfg["obs_groups"], self.env)
@@ -429,13 +420,13 @@ class OnPolicyRunner:
 
         # Initialize the policy
         actor_critic_class = eval(self.policy_cfg.pop("class_name"))
-        actor_critic: ActorCritic | ActorCriticRecurrent = actor_critic_class(
+        actor_critic: ActorCritic | ActorCriticRecurrent | ActorCritic_DWAQ = actor_critic_class(
             obs, self.cfg["obs_groups"], self.env.num_actions, **self.policy_cfg
         ).to(self.device)
 
         # Initialize the algorithm
         alg_class = eval(self.alg_cfg.pop("class_name"))
-        alg: PPO = alg_class(actor_critic, device=self.device, **self.alg_cfg, multi_gpu_cfg=self.multi_gpu_cfg)
+        alg: PPO | DWAQPPO = alg_class(actor_critic, device=self.device, **self.alg_cfg, multi_gpu_cfg=self.multi_gpu_cfg)
 
         # Initialize the storage
         alg.init_storage(
@@ -447,178 +438,6 @@ class OnPolicyRunner:
         )
 
         return alg
-
-    def _prepare_dwaq_context(self) -> None:
-        required_attributes = ["num_obs", "num_obs_hist", "num_actions", "num_envs"]
-        missing_attributes = [name for name in required_attributes if not hasattr(self.env, name)]
-        if missing_attributes:
-            raise AttributeError(
-                "DWAQPPO requires the environment to define "
-                + ", ".join(f"`{name}`" for name in missing_attributes)
-                + "."
-            )
-
-        self._dwaq_num_obs = int(self.env.num_obs)
-        self._dwaq_num_privileged_obs = (
-            int(self.env.num_privileged_obs) if getattr(self.env, "num_privileged_obs", None) is not None else self._dwaq_num_obs
-        )
-        self._dwaq_num_obs_hist = int(self.env.num_obs_hist)
-        self._dwaq_cenet_in_dim = self._dwaq_num_obs * self._dwaq_num_obs_hist
-
-    def _construct_dwaq_algorithm(self) -> DWAQPPO:
-        policy_class = eval(self.policy_cfg.pop("class_name"))
-        cenet_out_dim = self.policy_cfg.pop("cenet_out_dim", 19)
-        actor_critic: ActorCritic_DWAQ = policy_class(
-            num_actor_obs=self._dwaq_num_obs + cenet_out_dim,
-            num_critic_obs=self._dwaq_num_privileged_obs,
-            num_actions=self.env.num_actions,
-            cenet_in_dim=self._dwaq_cenet_in_dim,
-            cenet_out_dim=cenet_out_dim,
-            obs_dim=self._dwaq_num_obs,
-            **self.policy_cfg,
-        ).to(self.device)
-
-        alg_class = eval(self.alg_cfg.pop("class_name"))
-        alg: DWAQPPO = alg_class(
-            actor_critic,
-            device=self.device,
-            obs_dim=self._dwaq_num_obs,
-            **self.alg_cfg,
-            multi_gpu_cfg=self.multi_gpu_cfg,
-        )
-        alg.init_storage(
-            self.env.num_envs,
-            self.num_steps_per_env,
-            [self._dwaq_num_obs],
-            [self._dwaq_num_privileged_obs],
-            [self._dwaq_cenet_in_dim],
-            [self.env.num_actions],
-        )
-        return alg
-
-    def _get_dwaq_observations(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        obs_output = self.env.get_observations()
-        if not isinstance(obs_output, tuple) or len(obs_output) != 2:
-            raise TypeError("DWAQPPO expects env.get_observations() to return `(obs, obs_history)`.")
-        obs, obs_history = obs_output
-
-        privileged_obs = None
-        prev_critic_obs = None
-        if hasattr(self.env, "get_privileged_observations"):
-            critic_output = self.env.get_privileged_observations()
-            if not isinstance(critic_output, tuple) or len(critic_output) != 2:
-                raise TypeError(
-                    "DWAQPPO expects env.get_privileged_observations() to return "
-                    "`(privileged_obs, prev_critic_obs)`."
-                )
-            privileged_obs, prev_critic_obs = critic_output
-
-        critic_obs = privileged_obs if privileged_obs is not None else obs
-        prev_critic_obs = prev_critic_obs if prev_critic_obs is not None else critic_obs
-        return obs, critic_obs, prev_critic_obs, obs_history
-
-    def _extract_dwaq_step_observations(
-        self,
-        obs: torch.Tensor,
-        extras: dict,
-        prev_obs_history: torch.Tensor,
-        prev_critic_obs: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        obs_dict = extras.get("observations", {})
-        critic_obs = obs_dict.get("critic")
-        obs_history = obs_dict.get("obs_hist", prev_obs_history)
-        next_prev_critic_obs = obs_dict.get("prev_critic_obs", prev_critic_obs)
-
-        if critic_obs is None:
-            critic_obs = obs
-        if next_prev_critic_obs is None:
-            next_prev_critic_obs = critic_obs
-
-        return obs, critic_obs, next_prev_critic_obs, obs_history
-
-    def _learn_dwaq(self, num_learning_iterations: int, init_at_random_ep_len: bool = False) -> None:
-        self._prepare_logging_writer()
-
-        if init_at_random_ep_len:
-            self.env.episode_length_buf = torch.randint_like(
-                self.env.episode_length_buf, high=int(self.env.max_episode_length)
-            )
-
-        obs, critic_obs, prev_critic_obs, obs_history = self._get_dwaq_observations()
-        obs = obs.to(self.device)
-        critic_obs = critic_obs.to(self.device)
-        prev_critic_obs = prev_critic_obs.to(self.device)
-        obs_history = obs_history.to(self.device)
-        self.train_mode()
-
-        ep_infos = []
-        rewbuffer = deque(maxlen=100)
-        lenbuffer = deque(maxlen=100)
-        cur_reward_sum = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
-        cur_episode_length = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
-
-        if self.is_distributed:
-            print(f"Synchronizing parameters for rank {self.gpu_global_rank}...")
-            self.alg.broadcast_parameters()
-
-        start_iter = self.current_learning_iteration
-        tot_iter = start_iter + num_learning_iterations
-        for it in range(start_iter, tot_iter):
-            start = time.time()
-            with torch.inference_mode():
-                for _ in range(self.num_steps_per_env):
-                    actions = self.alg.act(obs, critic_obs, prev_critic_obs, obs_history)
-                    obs, rewards, dones, extras = self.env.step(actions.to(self.env.device))
-                    obs, critic_obs, prev_critic_obs, obs_history = self._extract_dwaq_step_observations(
-                        obs, extras, obs_history, prev_critic_obs
-                    )
-                    obs = obs.to(self.device)
-                    critic_obs = critic_obs.to(self.device)
-                    prev_critic_obs = prev_critic_obs.to(self.device)
-                    obs_history = obs_history.to(self.device)
-                    rewards = rewards.to(self.device)
-                    dones = dones.to(self.device)
-
-                    self.alg.process_env_step(rewards, dones, extras)
-
-                    if self.log_dir is not None:
-                        if "episode" in extras:
-                            ep_infos.append(extras["episode"])
-                        elif "log" in extras:
-                            ep_infos.append(extras["log"])
-                        cur_reward_sum += rewards
-                        cur_episode_length += 1
-                        new_ids = (dones > 0).nonzero(as_tuple=False)
-                        rewbuffer.extend(cur_reward_sum[new_ids][:, 0].cpu().numpy().tolist())
-                        lenbuffer.extend(cur_episode_length[new_ids][:, 0].cpu().numpy().tolist())
-                        cur_reward_sum[new_ids] = 0
-                        cur_episode_length[new_ids] = 0
-
-                stop = time.time()
-                collection_time = stop - start
-                start = stop
-                self.alg.compute_returns(critic_obs.clone())
-
-            loss_dict = self.alg.update()
-
-            stop = time.time()
-            learn_time = stop - start
-            self.current_learning_iteration = it
-
-            if self.log_dir is not None and not self.disable_logs:
-                self.log(locals())
-                if it % self.save_interval == 0:
-                    self.save(os.path.join(self.log_dir, f"model_{it}.pt"))
-
-            ep_infos.clear()
-            if it == start_iter and not self.disable_logs:
-                git_file_paths = store_code_state(self.log_dir, self.git_status_repos)
-                if self.logger_type in ["wandb", "neptune"] and git_file_paths:
-                    for path in git_file_paths:
-                        self.writer.save_file(path)
-
-        if self.log_dir is not None and not self.disable_logs:
-            self.save(os.path.join(self.log_dir, f"model_{self.current_learning_iteration}.pt"))
 
     def _prepare_logging_writer(self) -> None:
         """Prepare the logging writers."""
